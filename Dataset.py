@@ -26,6 +26,8 @@ class Dataset(object):
         self.testNegatives = self.load_negative_file(path + ".test.negative")
         assert len(self.testRatings) == len(self.testNegatives)
         self.num_users, self.num_items = self.trainMatrix.shape
+        print("Number of users: "+str(self.num_users))
+        print("Number of items: "+str(self.num_items))
 
     def load_rating_file_as_list(self, filename):
         ratingList = []
@@ -76,7 +78,7 @@ class Dataset(object):
                 if (rating > 0):
                     mat[user, item] = 1.0
                 line = f.readline()
-        print "already load the trainMatrix..."
+        print("already load the trainMatrix...")
         return mat
 
     def load_training_file_as_list(self, filename):
@@ -99,5 +101,5 @@ class Dataset(object):
                 items.append(i)
                 line = f.readline()
         lists.append(items)
-        print "already load the trainList..."
+        print("already load the trainList...")
         return lists
