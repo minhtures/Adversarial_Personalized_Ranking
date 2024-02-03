@@ -3,7 +3,8 @@ from __future__ import division
 import os
 import math
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 from multiprocessing import Pool
 from multiprocessing import cpu_count
 import argparse
@@ -11,8 +12,8 @@ import logging
 from time import time
 from time import strftime
 from time import localtime
+import datetime
 from Dataset import Dataset
-
 from AMF import MF
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -29,11 +30,13 @@ _output = None
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run AMF.")
+    parser = argparse.ArgumentParser(description="Run distillation MF.")
     parser.add_argument('--path', nargs='?', default='Data/',
                         help='Input data path.')
     parser.add_argument('--dataset', nargs='?', default='yelp',
                         help='Choose a dataset.')
+    parser.add_argument('--teacher_model', nargs='?', default='',
+                        help='Choose a teacher model.')
     parser.add_argument('--verbose', type=int, default=1,
                         help='Evaluate per X epochs.')
     parser.add_argument('--batch_size', type=int, default=512,
@@ -79,17 +82,15 @@ def sampling(dataset):
     return _user_input, _item_input_pos
 
 
-def shuffle(samples, batch_size, dataset, teacher_model):
+def shuffle(samples, batch_size, dataset):
     global _user_input
     global _item_input_pos
     global _batch_size
     global _index
-    global _teacher_model
     global _dataset
     _user_input, _item_input_pos = samples
     _batch_size = batch_size
-    _index = range(len(_user_input))
-    _teacher_model = teacher_model
+    _index = list(range(len(_user_input)))
     _dataset = dataset
     np.random.shuffle(_index)
     num_batch = len(_user_input) // _batch_size
@@ -110,30 +111,27 @@ def _get_train_batch(i):
         user_batch.append(_user_input[_index[idx]])
         item_batch.append(_item_input_pos[_index[idx]])
         with tf.compat.v1.Session() as sess:
-          feed_dict = {_teacher_model.user_input: user_batch[-1], _teacher_model.item_input_pos: item_batch[-1]}
-          prediction = sess.run(_teacher_model.output, feed_dict)    # teacher model predict without adversarial noise
-          rating_batch.append(prediction)
-      
+            feed_dict = {teacher_model.user_input: user_batch[-1], teacher_model.item_input_pos: item_batch[-1]}
+            rating_batch.append(sess.run(teacher_model.output_adv, feed_dict))
     return np.array(user_batch)[:, None], np.array(item_batch)[:, None], np.array(rating_batch)[:, None]
 
-
 # prediction model
-class DMF(MF):
+class MF_distillation(MF):
     def __init__(self, num_users, num_items, args):
-        super().__init__()
+        super().__init__(num_users, num_items, args)
 
     def _create_placeholders(self):
         with tf.name_scope("input_data"):
-            tf.compat.v1.disable_eager_execution()
-            self.user_input = tf.compat.v1.placeholder(tf.int32, shape=(None, 1), name="user_input")
-            self.item_input_pos = tf.compat.v1.placeholder(tf.int32, shape=(None, 1), name="item_input_pos")
-            self.rating = tf.compat.v1.placeholder(tf.int32, shape=(None, 1), name="rating")
-          
+            self.user_input = tf.placeholder(tf.int32, shape=[None, 1], name="user_input")
+            self.item_input_pos = tf.placeholder(tf.int32, shape=[None, 1], name="item_input_pos")
+            self.rating = tf.placeholder(tf.int32, shape=(None, 1), name="rating")
+
     def _create_loss(self):
         with tf.name_scope("loss"):
             # loss for L(Theta)
-            self.output, embed_p_pos, embed_q_pos = self._create_inference(self.item_input_pos)
-            self.loss = tf.reduce_mean(( self.output - self.rating )**2)    # MSE loss
+            self.output, embed_p_pos, embed_q_pos = self._create_inference(self.item_input)
+            # self.loss = tf.reduce_sum(tf.log(1 + tf.exp(-self.result))) # this is numerically unstable
+            self.loss = ( self.output - self.rating )**2
 
             # loss to be omptimized
             self.opt_loss = self.loss + self.reg * tf.reduce_mean(tf.square(embed_p_pos) + tf.square(embed_q_pos) + tf.square(embed_q_neg)) # embed_p_pos == embed_q_neg
@@ -141,25 +139,14 @@ class DMF(MF):
             if self.adver:
                 # loss for L(Theta + adv_Delta)
                 self.output_adv, embed_p_pos, embed_q_pos = self._create_inference_adv(self.item_input_pos)
-                self.loss_adv = tf.reduce_mean(( self.output_adv - self.rating )**2)    # MSE loss
+                self.loss_adv = ( self.output - self.rating )**2
                 self.opt_loss += self.reg_adv * self.loss_adv + \
                                  self.reg * tf.reduce_mean(tf.square(embed_p_pos) + tf.square(embed_q_pos) + tf.square(embed_q_neg))
-
-    def _create_optimizer(self):
-        with tf.name_scope("optimizer"):
-            self.optimizer = tf.compat.v1.train.AdagradOptimizer(learning_rate=self.learning_rate).minimize(self.opt_loss)
-
-    def build_graph(self):
-        self._create_placeholders()
-        self._create_variables()
-        self._create_loss()
-        self._create_optimizer()
-        self._create_adversarial()
 
 
 # training
 def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver is an object to save pq
-    with tf.compat.v1.Session() as sess:
+    with tf.Session() as sess:
         # initialized the save op
         if args.adver:
             ckpt_save_path = "Pretrain/%s/APR/embed_%d/%s/" % (args.dataset, args.embed_size, time_stamp)
@@ -173,10 +160,10 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
         if ckpt_restore_path and not os.path.exists(ckpt_restore_path):
             os.makedirs(ckpt_restore_path)
 
-        saver_ckpt = tf.compat.v1.train.Saver({'embedding_P': model.embedding_P, 'embedding_Q': model.embedding_Q})
+        saver_ckpt = tf.train.Saver({'embedding_P': model.embedding_P, 'embedding_Q': model.embedding_Q})
 
         # pretrain or not
-        sess.run(tf.compat.v1.global_variables_initializer())
+        sess.run(tf.global_variables_initializer())
 
         # restore the weights when pretrained
         if args.restore is not None or epoch_start:
@@ -185,7 +172,10 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
                 saver_ckpt.restore(sess, ckpt.model_checkpoint_path)
         # initialize the weights
         else:
-            logging.info("Initialized from scratch")
+            # Add log
+            # logging.info("Initialized from scratch")
+            init_logger = init_logging(args, time_stamp)
+            init_logger.info("Initialized from scratch")
             print("Initialized from scratch")
 
         # initialize for Evaluate
@@ -216,8 +206,15 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
             train_time = time() - train_begin
 
             if epoch_count % args.verbose == 0:
+                # _, ndcg, cur_res = output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts,
+                #                                    epoch_count, batch_time, train_time, prev_acc, output_adv=0)
+
+                # Add logger
+                now = datetime.datetime.now()
+                result_logger = result_logging()
+                result_logger.info("Start at: "+ str(now))
                 _, ndcg, cur_res = output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts,
-                                                   epoch_count, batch_time, train_time, prev_acc, output_adv=0)
+                                                   epoch_count, batch_time, train_time, prev_acc, output_adv=0, logger=result_logger)
 
             # print and log the best result
             if max_ndcg < ndcg:
@@ -226,10 +223,24 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
                 best_res['epoch'] = epoch_count
 
             if model.epochs == epoch_count:
-                print("Epoch %d is the best epoch" % best_res['epoch'])
+                best_epoch_ = best_res['epoch']
+                
+                # Add logger
+                label_log = f"Epoch {best_epoch_} is the best epoch"
+                result_logger.info(label_log)
+
+                # print (f"Epoch {best_epoch_} is the best epoch")
+                print (label_log)
+                
                 for idx, (hr_k, ndcg_k, auc_k) in enumerate(np.swapaxes(best_res['result'], 0, 1)):
-                    res = "K = %d: HR = %.4f, NDCG = %.4f AUC = %.4f" % (idx + 1, hr_k, ndcg_k, auc_k)
-                    print(res)
+                    res = f"K = {idx + 1}: HR = {hr_k}, NDCG = {ndcg_k} AUC = {auc_k}"
+
+                    # Add logger
+                    result_logger.info(res)
+                    now = datetime.datetime.now()
+                    result_logger.info("Start at: "+ str(now))
+
+                    print (res)
 
             # save the embedding weights
             if args.ckpt > 0 and epoch_count % args.ckpt == 0:
@@ -238,8 +249,10 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
         saver_ckpt.save(sess, ckpt_save_path + 'weights', global_step=epoch_count)
 
 
+# def output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts, epoch_count, batch_time, train_time, prev_acc,
+#                     output_adv):
 def output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts, epoch_count, batch_time, train_time, prev_acc,
-                    output_adv):
+                    output_adv, logger):
     loss_begin = time()
     train_loss, post_acc = training_loss_acc(model, sess, train_batches, output_adv)
     loss_time = time() - loss_begin
@@ -255,6 +268,9 @@ def output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts, epoch_
     res = "Epoch %d [%.1fs + %.1fs]: HR = %.4f, NDCG = %.4f ACC = %.4f ACC_adv = %.4f [%.1fs], |P|=%.2f, |Q|=%.2f" % \
           (epoch_count, batch_time, train_time, hr, ndcg, prev_acc,
            post_acc, eval_time, np.linalg.norm(embedding_P), np.linalg.norm(embedding_Q))
+    
+    # Add logger
+    logger.info(res)
 
     print(res)
 
@@ -264,20 +280,15 @@ def output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts, epoch_
 # input: batch_index (shuffled), model, sess, batches
 # do: train the model optimizer
 def training_batch(model, sess, batches, adver=False):
-    user_input, item_input_pos, rating = batches
-    # dns for every mini-batch
-    # dns = 1, i.e., BPR
-        item_input_neg = item_dns_list
-        # for BPR training
+    user_input, item_input_pos, user_dns_list, item_dns_list = batches
+    # for BPR training
     for i in range(len(user_input)):
         feed_dict = {model.user_input: user_input[i],
-                     model.item_input_pos: item_input_pos[i],
-                     model.rating: rating[i]}
+                    model.item_input_pos: item_input_pos[i]}
         if adver:
             sess.run([model.update_P, model.update_Q], feed_dict)
         sess.run(model.optimizer, feed_dict)
-    return user_input, item_input_pos, rating
-
+    return user_input, item_input_pos
 
 # calculate the gradients
 # update the adversarial noise
@@ -301,17 +312,16 @@ def training_loss_acc(model, sess, train_batches, output_adv):
     num_batch = len(train_batches[1])
     user_input, item_input_pos, rating = train_batches
     for i in range(len(user_input)):
-        # print(user_input[i][0]. item_input_pos[i][0], rating[i][0])
+        # print(user_input[i][0]. item_input_pos[i][0], item_input_neg[i][0])
         feed_dict = {model.user_input: user_input[i],
                      model.item_input_pos: item_input_pos[i],
                      model.rating: rating[i]}
         if output_adv:
-            loss, output_rating, true_rating = sess.run([model.loss_adv, model.output_adv, model.rating], feed_dict)
+            loss, pred_rating, truth_rating = sess.run([model.loss_adv, model.output_adv, model.rating], feed_dict)
         else:
-            loss, output_rating, true_rating = sess.run([model.loss, model.output, model.rating], feed_dict)
+            loss, pred_rating, truth_rating = sess.run([model.loss, model.output, model.rating], feed_dict)
         train_loss += loss
-        # acc += ((output_pos - output_neg) > 0).sum() / len(output_pos)
-        mse +=  tf.reduce_mean(( output_rating - true_rating )**2)
+        mse += (pred_rating, truth_rating)**2 / len(pred_rating)
     return train_loss / num_batch, mse / num_batch
 
 
@@ -389,42 +399,80 @@ def _eval_by_user(user):
     return hr, ndcg, auc
 
 def init_logging(args, time_stamp):
-    path = "Log/%s_%s/" % (strftime('%Y-%m-%d_%H', localtime()), args.task)
+    path = "Log/init/%s_%s/" % (strftime('%Y-%m-%d_%H', localtime()), args.task)
     if not os.path.exists(path):
         os.makedirs(path)
-    logging.basicConfig(filename=path + "%s_log_embed_size%d_%s" % (args.dataset, args.embed_size, time_stamp),
-                        level=logging.INFO)
-    logging.info(args)
+    file_name = path + "INIT_%s_log_embed_size%d_%s" % (args.dataset, args.embed_size, time_stamp)
+
+    logger = setup_logger(file_name, file_name + '.log', formatter=None, level=logging.INFO)
+    logger.info(args)
     print(args)
 
+    return logger
 
+def result_logging(formatter=None):
+    path = "Log/result/%s_%s/" % (strftime('%Y-%m-%d_%H', localtime()), args.task)
+    if not os.path.exists(path):
+        os.makedirs(path)
+    file_name = path + "RESULT_%s_log_embed_size%d_%s" % (args.dataset, args.embed_size, time_stamp)
+
+    logger = setup_logger(file_name, file_name + '.log', formatter, level=logging.INFO)
+
+    return logger
+
+# Setup for multiple logs
+def setup_logger(name, log_file, formatter, level=logging.INFO):
+    """To setup as many loggers as you want"""
+
+    handler = logging.FileHandler(log_file)        
+    handler.setFormatter(formatter)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.addHandler(handler)
+
+    return logger
+
+global teacher_model
+global dataset
 if __name__ == '__main__':
 
     time_stamp = strftime('%Y_%m_%d_%H_%M_%S', localtime())
 
     # initilize arguments and logging
     args = parse_args()
-    init_logging(args, time_stamp)
 
     # initialize dataset
     dataset = Dataset(args.path + args.dataset)
 
+    # inititalize teacher model
+    teacher_model=MF(dataset.num_users, dataset.num_items, args)
+    with tf.Session() as sess:
+    # initialized the save op
+        ckpt_path = args.teacher_model
+        saver_ckpt = tf.train.Saver({'embedding_P': teacher_model.embedding_P, 'embedding_Q': teacher_model.embedding_Q})
+        # pretrain or not
+        sess.run(tf.global_variables_initializer())
+
+        ckpt = tf.train.get_checkpoint_state(ckpt_path)
+        saver_ckpt.restore(sess, ckpt.model_checkpoint_path)
+
     args.adver = 0
     # initialize MF_BPR models
-    distill_MF_BPR = DMF(dataset.num_users, dataset.num_items, args)
+    distill_MF_BPR = MF_distillation(dataset.num_users, dataset.num_items, args)
     distill_MF_BPR.build_graph()
 
-    print("Initialize distill_MF_BPR")
+    print("Initialize MF_BPR")
 
     # start training
     training(distill_MF_BPR, dataset, args, epoch_start=0, epoch_end=args.adv_epoch-1, time_stamp=time_stamp)
 
     args.adver = 1
-    # instialize distilaltion AMF model
-    distill_AMF = DMF(dataset.num_users, dataset.num_items, args)
+    # instialize AMF model
+    distill_AMF = MF_distillation(dataset.num_users, dataset.num_items, args)
     distill_AMF.build_graph()
 
-    print("Initialize distill_AMF")
+    print("Initialize AMF")
 
     # start training
     training(distill_AMF, dataset, args, epoch_start=args.adv_epoch, epoch_end=args.epochs, time_stamp=time_stamp)
