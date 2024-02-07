@@ -33,9 +33,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run distillation MF.")
     parser.add_argument('--path', nargs='?', default='Data/',
                         help='Input data path.')
-    parser.add_argument('--dataset', nargs='?', default='yelp',
+    parser.add_argument('--dataset', nargs='?', default='book-crossing',
                         help='Choose a dataset.')
-    parser.add_argument('--teacher_model', nargs='?', default='',
+    parser.add_argument('--teacher_model', nargs='?', default='Pretrain/book-crossing/MF_BPR/embed_64/grad/best-640',
                         help='Choose a teacher model.')
     parser.add_argument('--verbose', type=int, default=1,
                         help='Evaluate per X epochs.')
@@ -74,7 +74,7 @@ def parse_args():
 # input: dataset(Mat, List, Rating, Negatives), batch_choice, num_negatives
 # output: [_user_input_list, _item_input_pos_list]
 def sampling(dataset):
-    _user_input, _item_input_pos = [], []
+    _user_input, _item_input_pos, _rating = [], [], []
     for (u, i) in dataset.trainMatrix.keys():
         # positive instance
         _user_input.append(u)
@@ -82,22 +82,28 @@ def sampling(dataset):
     return _user_input, _item_input_pos
 
 
-def shuffle(samples, batch_size, dataset):
+
+def shuffle(samples, batch_size, dataset, teacher_model, sess):
     global _user_input
     global _item_input_pos
     global _batch_size
     global _index
+    global _teacher_model
+    global _sess
     global _dataset
     _user_input, _item_input_pos = samples
     _batch_size = batch_size
     _index = list(range(len(_user_input)))
+    _teacher_model = teacher_model
+    _sess = sess
     _dataset = dataset
     np.random.shuffle(_index)
     num_batch = len(_user_input) // _batch_size
-    pool = Pool(cpu_count())
-    res = pool.map(_get_train_batch, range(num_batch))
-    pool.close()
-    pool.join()
+    # pool = Pool(cpu_count())
+    # res = pool.map(_get_train_batch, range(num_batch))
+    # pool.close()
+    # pool.join()
+    res = [_get_train_batch(i) for i in range(num_batch)]
     user_list = [r[0] for r in res]
     item_pos_list = [r[1] for r in res]
     rating_list = [r[2] for r in res]
@@ -109,11 +115,15 @@ def _get_train_batch(i):
     begin = i * _batch_size
     for idx in range(begin, begin + _batch_size):
         user_batch.append(_user_input[_index[idx]])
-        item_batch.append(_item_input_pos[_index[idx]])
-        with tf.compat.v1.Session() as sess:
-            feed_dict = {teacher_model.user_input: user_batch[-1], teacher_model.item_input_pos: item_batch[-1]}
-            rating_batch.append(sess.run(teacher_model.output_adv, feed_dict))
-    return np.array(user_batch)[:, None], np.array(item_batch)[:, None], np.array(rating_batch)[:, None]
+        # item_batch.append(_item_input_pos[_index[idx]])
+        # rating_batch.append(_rating[_index[idx]])
+        u =_user_input[_index[idx]]
+        j = np.random.randint(_dataset.num_items)
+        item_batch.append(j)
+    feed_dict = {_teacher_model.user_input: np.array(user_batch)[:, None], _teacher_model.item_input_pos: np.array(item_batch)[:, None]}
+    rating_batch = _sess.run(_teacher_model.output, feed_dict)
+
+    return np.array(user_batch)[:, None], np.array(item_batch)[:, None], rating_batch
 
 # prediction model
 class MF_distillation(MF):
@@ -124,43 +134,46 @@ class MF_distillation(MF):
         with tf.name_scope("input_data"):
             self.user_input = tf.placeholder(tf.int32, shape=[None, 1], name="user_input")
             self.item_input_pos = tf.placeholder(tf.int32, shape=[None, 1], name="item_input_pos")
-            self.rating = tf.placeholder(tf.int32, shape=(None, 1), name="rating")
+            self.rating = tf.placeholder(tf.float32, shape=[None, 1], name="rating")
 
     def _create_loss(self):
         with tf.name_scope("loss"):
             # loss for L(Theta)
-            self.output, embed_p_pos, embed_q_pos = self._create_inference(self.item_input)
+            self.output, embed_p_pos, embed_q_pos = self._create_inference(self.item_input_pos)
             # self.loss = tf.reduce_sum(tf.log(1 + tf.exp(-self.result))) # this is numerically unstable
-            self.loss = ( self.output - self.rating )**2
+            self.loss = tf.reduce_mean(tf.square( self.output - self.rating ))
 
             # loss to be omptimized
-            self.opt_loss = self.loss + self.reg * tf.reduce_mean(tf.square(embed_p_pos) + tf.square(embed_q_pos) + tf.square(embed_q_neg)) # embed_p_pos == embed_q_neg
+            self.opt_loss = self.loss + self.reg * tf.reduce_mean(tf.square(embed_p_pos) + tf.square(embed_q_pos))
 
             if self.adver:
                 # loss for L(Theta + adv_Delta)
                 self.output_adv, embed_p_pos, embed_q_pos = self._create_inference_adv(self.item_input_pos)
-                self.loss_adv = ( self.output - self.rating )**2
+                self.loss_adv = tf.reduce_mean(tf.square( self.output_adv - self.rating ))
                 self.opt_loss += self.reg_adv * self.loss_adv + \
-                                 self.reg * tf.reduce_mean(tf.square(embed_p_pos) + tf.square(embed_q_pos) + tf.square(embed_q_neg))
+                                 self.reg * tf.reduce_mean(tf.square(embed_p_pos) + tf.square(embed_q_pos))
 
 
 # training
-def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver is an object to save pq
+def training(model, teacher_model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver is an object to save pq
     with tf.Session() as sess:
         # initialized the save op
         if args.adver:
-            ckpt_save_path = "Pretrain/%s/APR/embed_%d/%s/" % (args.dataset, args.embed_size, time_stamp)
-            ckpt_restore_path = "Pretrain/%s/MF_BPR/embed_%d/%s/" % (args.dataset, args.embed_size, time_stamp)
+            ckpt_save_path = "Pretrain/%s/distill_APR/embed_%d/%s/" % (args.dataset, args.embed_size, time_stamp)
+            ckpt_restore_path = "Pretrain/%s/distill_MF_BPR/embed_%d/%s/" % (args.dataset, args.embed_size, time_stamp)
         else:
-            ckpt_save_path = "Pretrain/%s/MF_BPR/embed_%d/%s/" % (args.dataset, args.embed_size, time_stamp)
-            ckpt_restore_path = 0 if args.restore is None else "Pretrain/%s/MF_BPR/embed_%d/%s/" % (args.dataset, args.embed_size, args.restore)
+            ckpt_save_path = "Pretrain/%s/distill_MF_BPR/embed_%d/%s/" % (args.dataset, args.embed_size, time_stamp)
+            ckpt_restore_path = 0 if args.restore is None else "Pretrain/%s/distill_MF_BPR/embed_%d/%s/" % (args.dataset, args.embed_size, args.restore)
 
         if not os.path.exists(ckpt_save_path):
             os.makedirs(ckpt_save_path)
         if ckpt_restore_path and not os.path.exists(ckpt_restore_path):
             os.makedirs(ckpt_restore_path)
 
-        saver_ckpt = tf.train.Saver({'embedding_P': model.embedding_P, 'embedding_Q': model.embedding_Q})
+        saver_ckpt = tf.train.Saver({'embedding_P': model.embedding_P, 'embedding_Q': model.embedding_Q, \
+                                     'delta_P': model.delta_P, 'delta_Q': model.delta_Q})
+        best_ckpt = tf.train.Saver(var_list={'embedding_P': model.embedding_P, 'embedding_Q': model.embedding_Q, \
+                                     'delta_P': model.delta_P, 'delta_Q': model.delta_Q}, max_to_keep=5)
 
         # pretrain or not
         sess.run(tf.global_variables_initializer())
@@ -181,8 +194,23 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
         # initialize for Evaluate
         eval_feed_dicts = init_eval_model(model, dataset)
 
-        # sample the data
+        teacher_result = evaluate(teacher_model, sess, dataset, eval_feed_dicts, output_adv=0)
+        hr, ndcg, auc = np.swapaxes(teacher_result, 0, 1)[-1]
+        res = "Teacher result: HR = %.4f, NDCG = %.4f, AUC = %.4f" % (hr, ndcg, auc)
+        print(res)
+
+        teacher_path = args.teacher_model
+        teacher_ckpt = tf.train.Saver({'embedding_P': teacher_model.embedding_P, 'embedding_Q': teacher_model.embedding_Q, \
+                                     'delta_P': teacher_model.delta_P, 'delta_Q': teacher_model.delta_Q})
+        teacher_ckpt.restore(sess, teacher_path)
+
+        print("sample the data")
         samples = sampling(dataset)
+
+        teacher_result = evaluate(teacher_model, sess, dataset, eval_feed_dicts, output_adv=0)
+        hr, ndcg, auc = np.swapaxes(teacher_result, 0, 1)[-1]
+        res = "Teacher result: HR = %.4f, NDCG = %.4f, AUC = %.4f" % (hr, ndcg, auc)
+        print(res)
 
         # initialize the max_ndcg to memorize the best result
         max_ndcg = 0
@@ -193,12 +221,12 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
 
             # initialize for training batches
             batch_begin = time()
-            batches = shuffle(samples, args.batch_size, dataset, model)
+            batches = shuffle(samples, args.batch_size, dataset, teacher_model, sess)
             batch_time = time() - batch_begin
 
             # compute the accuracy before training
-            prev_batch = batches[0], batches[1], batches[3]
-            _, prev_acc = training_loss_acc(model, sess, prev_batch, output_adv=0)
+            prev_batch = batches[0], batches[1], batches[2]
+            train_loss, prev_acc = training_loss_acc(model, sess, prev_batch, output_adv=0)
 
             # training the model
             train_begin = time()
@@ -215,12 +243,13 @@ def training(model, dataset, args, epoch_start, epoch_end, time_stamp):  # saver
                 result_logger.info("Start at: "+ str(now))
                 _, ndcg, cur_res = output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts,
                                                    epoch_count, batch_time, train_time, prev_acc, output_adv=0, logger=result_logger)
-
+                print("TRain loss: %.4f" % (train_loss))
             # print and log the best result
             if max_ndcg < ndcg:
                 max_ndcg = ndcg
                 best_res['result'] = cur_res
                 best_res['epoch'] = epoch_count
+                best_ckpt.save(sess, ckpt_save_path + 'best', global_step=epoch_count)
 
             if model.epochs == epoch_count:
                 best_epoch_ = best_res['epoch']
@@ -280,15 +309,16 @@ def output_evaluate(model, sess, dataset, train_batches, eval_feed_dicts, epoch_
 # input: batch_index (shuffled), model, sess, batches
 # do: train the model optimizer
 def training_batch(model, sess, batches, adver=False):
-    user_input, item_input_pos, user_dns_list, item_dns_list = batches
+    user_input, item_input_pos, rating = batches
     # for BPR training
     for i in range(len(user_input)):
         feed_dict = {model.user_input: user_input[i],
-                    model.item_input_pos: item_input_pos[i]}
+                    model.item_input_pos: item_input_pos[i],
+                    model.rating: rating[i] }
         if adver:
             sess.run([model.update_P, model.update_Q], feed_dict)
         sess.run(model.optimizer, feed_dict)
-    return user_input, item_input_pos
+    return user_input, item_input_pos, rating
 
 # calculate the gradients
 # update the adversarial noise
@@ -321,8 +351,9 @@ def training_loss_acc(model, sess, train_batches, output_adv):
         else:
             loss, pred_rating, truth_rating = sess.run([model.loss, model.output, model.rating], feed_dict)
         train_loss += loss
-        mse += (pred_rating, truth_rating)**2 / len(pred_rating)
-    return train_loss / num_batch, mse / num_batch
+        neg_predict, pos_predict = pred_rating[:-1], pred_rating[-1]
+        acc += ((pos_predict - neg_predict) > 0).sum() / len(pos_predict)
+    return train_loss / num_batch, acc / len(user_input)
 
 
 def init_eval_model(model, dataset):
@@ -331,11 +362,11 @@ def init_eval_model(model, dataset):
     global _model
     _dataset = dataset
     _model = model
-
-    pool = Pool(cpu_count())
-    feed_dicts = pool.map(_evaluate_input, range(_dataset.num_users))
-    pool.close()
-    pool.join()
+    # pool = Pool(cpu_count())
+    # feed_dicts = pool.map(_evaluate_input, range(_dataset.num_users))
+    # pool.close()
+    # pool.join()
+    feed_dicts = [_evaluate_input(user) for user in range(dataset.num_users)]
 
     print("Load the evaluation model done [%.1f s]" % (time() - begin_time))
     return feed_dicts
@@ -433,8 +464,6 @@ def setup_logger(name, log_file, formatter, level=logging.INFO):
 
     return logger
 
-global teacher_model
-global dataset
 if __name__ == '__main__':
 
     time_stamp = strftime('%Y_%m_%d_%H_%M_%S', localtime())
@@ -445,17 +474,11 @@ if __name__ == '__main__':
     # initialize dataset
     dataset = Dataset(args.path + args.dataset)
 
-    # inititalize teacher model
-    teacher_model=MF(dataset.num_users, dataset.num_items, args)
-    with tf.Session() as sess:
-    # initialized the save op
-        ckpt_path = args.teacher_model
-        saver_ckpt = tf.train.Saver({'embedding_P': teacher_model.embedding_P, 'embedding_Q': teacher_model.embedding_Q})
-        # pretrain or not
-        sess.run(tf.global_variables_initializer())
+    print("inititalize teacher model")
 
-        ckpt = tf.train.get_checkpoint_state(ckpt_path)
-        saver_ckpt.restore(sess, ckpt.model_checkpoint_path)
+    args.adver = 0
+    teacher_model=MF(dataset.num_users, dataset.num_items, args)
+    teacher_model.build_graph()
 
     args.adver = 0
     # initialize MF_BPR models
@@ -465,7 +488,7 @@ if __name__ == '__main__':
     print("Initialize MF_BPR")
 
     # start training
-    training(distill_MF_BPR, dataset, args, epoch_start=0, epoch_end=args.adv_epoch-1, time_stamp=time_stamp)
+    training(distill_MF_BPR, teacher_model, dataset, args, epoch_start=0, epoch_end=args.adv_epoch-1, time_stamp=time_stamp)
 
     args.adver = 1
     # instialize AMF model
@@ -475,4 +498,4 @@ if __name__ == '__main__':
     print("Initialize AMF")
 
     # start training
-    training(distill_AMF, dataset, args, epoch_start=args.adv_epoch, epoch_end=args.epochs, time_stamp=time_stamp)
+    training(distill_AMF, teacher_model, dataset, args, epoch_start=args.adv_epoch, epoch_end=args.epochs, time_stamp=time_stamp)
